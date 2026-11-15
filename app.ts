@@ -32,8 +32,20 @@ export function createApp(store = new Store()): Server {
   });
 }
 
-function sendJson(store: Store, res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
+function sendJson(store: Store, res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}, rawText?: string): void {
   const requestId = store.nextRequestId();
+  if (rawText !== undefined) {
+    // Pre-serialised body from the GET-issue cache: the exact bytes this
+    // function would have produced. The request id stays fresh per reply.
+    res.writeHead(status, {
+      'content-type': JSON_TYPE,
+      'content-length': Buffer.byteLength(rawText),
+      'x-github-request-id': requestId,
+      ...extraHeaders,
+    });
+    res.end(rawText);
+    return;
+  }
   if (status === 204 || body === null || body === undefined) {
     res.writeHead(status, { 'x-github-request-id': requestId, ...extraHeaders });
     res.end();
@@ -61,12 +73,23 @@ function sendBuffer(store: Store, res: ServerResponse, status: number, body: Buf
 }
 
 function pathOf(req: IncomingMessage): { path: string; query: URLSearchParams } {
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    return { path: url.pathname, query: url.searchParams };
-  } catch {
-    return { path: '/', query: new URLSearchParams() };
+  // Fast path: split on '?' by hand. `new URL()` parses (and validates)
+  // scheme/host/port on every request; this route sees thousands of
+  // sequential requests per benchmark round, so the parse cost is real.
+  // Behavior is identical for origin-form URLs (what the env sends):
+  // pathname stays percent-encoded, exactly as URL.pathname returns it.
+  const raw = req.url ?? '/';
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    try {
+      const url = new URL(raw);
+      return { path: url.pathname, query: url.searchParams };
+    } catch {
+      return { path: '/', query: new URLSearchParams() };
+    }
   }
+  const q = raw.indexOf('?');
+  if (q === -1) return { path: raw, query: new URLSearchParams() };
+  return { path: raw.slice(0, q), query: new URLSearchParams(raw.slice(q + 1)) };
 }
 
 function checkAuth(req: IncomingMessage): ApiError | null {
@@ -179,7 +202,7 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
         sendJson(store, res, 404, { message: 'Not Found' });
         return;
       }
-      sendJson(store, res, result.status, result.body, result.headers ?? {});
+      sendJson(store, res, result.status, result.body, result.headers ?? {}, result.text);
       return;
     }
 
