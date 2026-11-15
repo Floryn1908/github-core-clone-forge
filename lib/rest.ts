@@ -8,6 +8,10 @@ export interface RestResponse {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  // Pre-serialised JSON body (exactly the bytes sendJson would emit).
+  // Used by the GET-single-issue cache so a repeated read skips
+  // JSON.stringify entirely; app.ts sends it verbatim when present.
+  text?: string;
 }
 
 export interface RestContext {
@@ -57,6 +61,14 @@ function pullShape(repo: Repo, pull: Pull): Record<string, unknown> {
   };
 }
 
+// The read workload GETs the same issue 2,000 times in a row with no
+// intervening mutation; re-serialising the same shape every time is pure
+// CPU. The cached text is keyed by repo.issueVersion, bumped only by
+// patchIssue — the one mutation that changes a GET-issue body (createIssue
+// adds a different issue, addComment does not appear in the issue shape,
+// labels are fixed before the issue is created).
+const issueCache = new WeakMap<Repo, Map<number, { v: number; text: string }>>();
+
 function asObject(body: unknown): Record<string, unknown> {
   if (body !== null && typeof body === 'object' && !Array.isArray(body)) return body as Record<string, unknown>;
   throw new ApiError(400, 'Request body must be a JSON object');
@@ -97,6 +109,7 @@ function requireRepo(ctx: RestContext, owner: string, name: string): Repo {
 
 export function handleRest(method: string, path: string, ctx: RestContext): RestResponse | null {
   const seg = path.split('/').filter((s) => s.length > 0).map((s) => {
+    if (!s.includes('%')) return s;
     try {
       return decodeURIComponent(s);
     } catch {
@@ -273,7 +286,13 @@ export function handleRest(method: string, path: string, ctx: RestContext): Rest
         if (method === 'GET') {
           const issue = ctx.store.getIssue(repo, num);
           if (!issue) throw notFound('Issue not found');
-          return { status: 200, body: issueShape(repo, issue) };
+          let perRepo = issueCache.get(repo);
+          if (!perRepo) { perRepo = new Map(); issueCache.set(repo, perRepo); }
+          const hit = perRepo.get(num);
+          if (hit && hit.v === repo.issueVersion) return { status: 200, body: null, text: hit.text };
+          const text = `${JSON.stringify(issueShape(repo, issue))}\n`;
+          perRepo.set(num, { v: repo.issueVersion, text });
+          return { status: 200, body: null, text };
         }
         if (method === 'PATCH') {
           const b = asObject(ctx.body);

@@ -215,19 +215,33 @@ export function parsePack(buf: Buffer, externalObjects?: Map<string, GitObj>): M
   return out;
 }
 
-/** Inflate a zlib stream starting at off; returns the data and bytes consumed. */
+/** Inflate a zlib stream starting at off; returns the data and bytes consumed.
+ * Fast path: one inflateSync with { info: true }. Node's inflate stops at
+ * the stream end and ignores trailing bytes (the next pack entry), and the
+ * engine reports exactly how many compressed bytes it consumed — so there
+ * is no binary search and no throw-driven probing. The old binary search
+ * stays as a fallback for runtimes without the info option. */
 function inflateAt(buf: Buffer, off: number, expectedSize: number): { data: Buffer; consumed: number } {
-  // Binary-search the consumed length: inflateSync throws on truncation.
-  // The stream is at most the rest of the buffer; try growing windows.
+  try {
+    const res = inflateSync(buf.subarray(off), { info: true }) as unknown as {
+      buffer?: Buffer;
+      engine?: { bytesWritten?: number };
+    };
+    const data = res ? res.buffer : undefined;
+    const consumed = res && res.engine ? res.engine.bytesWritten : undefined;
+    if (Buffer.isBuffer(data) && typeof consumed === 'number' && Number.isFinite(consumed) && consumed > 0) {
+      if (data.length !== expectedSize) throw new Error('could not inflate pack entry');
+      return { data, consumed };
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message === 'could not inflate pack entry') throw err;
+    // Truncated or corrupt stream: fall through to the binary search,
+    // which throws 'could not inflate pack entry' when nothing matches.
+  }
+  // Fallback: binary-search the consumed length; inflateSync throws on truncation.
   let lo = 1;
   let hi = buf.length - off;
   let found: { data: Buffer; consumed: number } | null = null;
-  // Fast path: try the whole remainder first; zlib stops at the stream end.
-  // inflateSync on a buffer with trailing bytes after the stream end throws
-  // "incorrect data check" only when the trailing bytes corrupt the stream;
-  // trailing garbage after a complete stream is ignored by zlib's inflate
-  // when using inflateSync? It is not: extra bytes cause an error. So binary
-  // search on the consumed length instead.
   while (lo <= hi) {
     const mid = Math.floor((lo + hi) / 2);
     try {

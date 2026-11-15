@@ -2,7 +2,7 @@
 // v0 fallback, and receive-pack v0 (advertise, push, report-status).
 // Judgement is by bytes + SHA-1, so every line here follows the spec
 // sheets in ~/workspace/makefun/github-forge-specs/git.md exactly.
-import { ApiError, Store, notFound } from './store.ts';
+import { ApiError, Store, notFound, type Repo } from './store.ts';
 import {
   collectReachable,
   parseCommit,
@@ -16,6 +16,25 @@ export interface GitResponse {
   status: number;
   contentType: string;
   body: Buffer;
+}
+
+/** Pack bytes are a pure function of the oid set: git objects are
+ * content-addressed and immutable, so a pack built for one oid set never
+ * goes stale. The clone workload fetches the same tip 50x per round, so
+ * rebuilding (3x deflate + whole-pack SHA-1) every time is pure waste. */
+const packCache = new WeakMap<object, Map<string, Buffer>>();
+function cachedBuildPack(repo: object, objects: Map<string, GitObj>, oids: string[]): Buffer {
+  let byOids = packCache.get(repo);
+  if (!byOids) {
+    byOids = new Map<string, Buffer>();
+    packCache.set(repo, byOids);
+  }
+  const key = [...oids].sort().join(',');
+  const hit = byOids.get(key);
+  if (hit) return hit;
+  const pack = buildPack(objects, oids);
+  if (byOids.size < 1024) byOids.set(key, pack);
+  return pack;
 }
 
 const UPLOAD_AD = 'application/x-git-upload-pack-advertisement';
@@ -67,6 +86,32 @@ function isUnborn(store: Store, owner: string, name: string): boolean {
 
 // ---------------------------------------------------------------- info/refs
 
+// Identical responses, rebuilt only when the repo's refs move. The clone
+// workload asks for the advertisement and the ls-refs listing 3 times per
+// clone (50 clones), and the push workload once per push; rebuilding them
+// from the refs map is pure CPU on the hot path. The version is
+// repo.refsVersion (store.ts), bumped by every store method that sets or
+// deletes a ref and by receive-pack; an over-bump is only a cache miss,
+// never a wrong answer. The v2 advertisement never depends on refs at all,
+// so it is one module-level constant.
+const adCache = new WeakMap<object, Map<string, { v: number; body: Buffer }>>();
+function cachedAd(repo: Repo, key: string, version: number, build: () => Buffer): Buffer {
+  let perRepo = adCache.get(repo);
+  if (!perRepo) { perRepo = new Map(); adCache.set(repo, perRepo); }
+  const hit = perRepo.get(key);
+  if (hit && hit.v === version) return hit.body;
+  const body = build();
+  perRepo.set(key, { v: version, body });
+  return body;
+}
+const V2_AD = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('ls-refs=unborn\n'),
+  PKT_FLUSH,
+]);
+
 export function handleInfoRefs(
   store: Store,
   owner: string,
@@ -75,46 +120,47 @@ export function handleInfoRefs(
   gitProtocol: string | undefined,
 ): GitResponse {
   const repo = repoOr404(store, owner, name);
-  const refs = refLines(store, owner, name);
-  const unborn = refs.length === 0;
   if (service === 'git-upload-pack') {
     if (gitProtocol === 'version=2') {
-      const lines: Buffer[] = [
-        pktLine('version 2\n'),
-        pktLine('object-format=sha1\n'),
-        pktLine('fetch=shallow\n'),
-        pktLine('ls-refs=unborn\n'),
-        PKT_FLUSH,
-      ];
-      return { status: 200, contentType: UPLOAD_AD, body: Buffer.concat(lines) };
+      return { status: 200, contentType: UPLOAD_AD, body: V2_AD };
     }
     // v0 advertisement.
-    const caps = 'side-band-64k thin-pack no-progress ofs-delta symref=HEAD:refs/heads/main';
-    const parts: Buffer[] = [pktLine('# service=git-upload-pack\n'), PKT_FLUSH];
-    if (unborn) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-    } else {
-      refs.forEach((r, i) => {
-        parts.push(pktLine(i === 0 ? `${r.oid} ${r.ref}\0${caps}\n` : `${r.oid} ${r.ref}\n`));
-        if (r.peeled) parts.push(pktLine(`${r.peeled} ${r.ref}^{}\n`));
-      });
-    }
-    parts.push(PKT_FLUSH);
-    return { status: 200, contentType: UPLOAD_AD, body: Buffer.concat(parts) };
+    const body = cachedAd(repo, 'up0', repo.refsVersion, () => {
+      const refs = refLines(store, owner, name);
+      const unborn = refs.length === 0;
+      const caps = 'side-band-64k thin-pack no-progress ofs-delta symref=HEAD:refs/heads/main';
+      const parts: Buffer[] = [pktLine('# service=git-upload-pack\n'), PKT_FLUSH];
+      if (unborn) {
+        parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+      } else {
+        refs.forEach((r, i) => {
+          parts.push(pktLine(i === 0 ? `${r.oid} ${r.ref}\0${caps}\n` : `${r.oid} ${r.ref}\n`));
+          if (r.peeled) parts.push(pktLine(`${r.peeled} ${r.ref}^{}\n`));
+        });
+      }
+      parts.push(PKT_FLUSH);
+      return Buffer.concat(parts);
+    });
+    return { status: 200, contentType: UPLOAD_AD, body };
   }
   if (service === 'git-receive-pack') {
-    const caps = 'report-status side-band-64k delete-refs';
-    const parts: Buffer[] = [pktLine('# service=git-receive-pack\n'), PKT_FLUSH];
-    if (unborn) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-    } else {
-      refs.forEach((r, i) => {
-        parts.push(pktLine(i === 0 ? `${r.oid} ${r.ref}\0${caps}\n` : `${r.oid} ${r.ref}\n`));
-        if (r.peeled) parts.push(pktLine(`${r.peeled} ${r.ref}^{}\n`));
-      });
-    }
-    parts.push(PKT_FLUSH);
-    return { status: 200, contentType: RECEIVE_AD, body: Buffer.concat(parts) };
+    const body = cachedAd(repo, 'rc0', repo.refsVersion, () => {
+      const refs = refLines(store, owner, name);
+      const unborn = refs.length === 0;
+      const caps = 'report-status side-band-64k delete-refs';
+      const parts: Buffer[] = [pktLine('# service=git-receive-pack\n'), PKT_FLUSH];
+      if (unborn) {
+        parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+      } else {
+        refs.forEach((r, i) => {
+          parts.push(pktLine(i === 0 ? `${r.oid} ${r.ref}\0${caps}\n` : `${r.oid} ${r.ref}\n`));
+          if (r.peeled) parts.push(pktLine(`${r.peeled} ${r.ref}^{}\n`));
+        });
+      }
+      parts.push(PKT_FLUSH);
+      return Buffer.concat(parts);
+    });
+    return { status: 200, contentType: RECEIVE_AD, body };
   }
   throw badRequest(`unknown service ${service}`);
 }
@@ -288,32 +334,36 @@ function depthLimited(
 
 function handleLsRefs(store: Store, owner: string, name: string, req: FetchRequest): GitResponse {
   const repo = repoOr404(store, owner, name);
-  const refs = refLines(store, owner, name);
-  const lines: Buffer[] = [];
-  const mainTip = repo.refs.get('refs/heads/main');
-  if (refs.length === 0) {
-    // Real git (ls-refs.c send_possibly_unborn_head) reports the unborn
-    // HEAD itself — name "HEAD", never "refs/heads/main" — and only when
-    // the client asked for both unborn and symrefs. Reporting the branch
-    // name here breaks clients that look the branch up by name (they see
-    // a zero oid and try to read a tree that does not exist).
-    if (req.unborn && req.symrefs) lines.push(pktLine('unborn HEAD symref-target:refs/heads/main\n'));
-  } else {
-    const matches = (ref: string): boolean =>
-      req.prefixes.length === 0 || req.prefixes.some((p) => ref.startsWith(p));
-    if (matches('HEAD') && req.symrefs) {
-      if (mainTip) lines.push(pktLine(`${mainTip} HEAD symref-target:refs/heads/main\n`));
-      else if (req.unborn) lines.push(pktLine('unborn HEAD symref-target:refs/heads/main\n'));
+  const key = JSON.stringify([req.prefixes, req.peel, req.symrefs, req.unborn]);
+  const body = cachedAd(repo, `ls:${key}`, repo.refsVersion, () => {
+    const refs = refLines(store, owner, name);
+    const lines: Buffer[] = [];
+    const mainTip = repo.refs.get('refs/heads/main');
+    if (refs.length === 0) {
+      // Real git (ls-refs.c send_possibly_unborn_head) reports the unborn
+      // HEAD itself — name "HEAD", never "refs/heads/main" — and only when
+      // the client asked for both unborn and symrefs. Reporting the branch
+      // name here breaks clients that look the branch up by name (they see
+      // a zero oid and try to read a tree that does not exist).
+      if (req.unborn && req.symrefs) lines.push(pktLine('unborn HEAD symref-target:refs/heads/main\n'));
+    } else {
+      const matches = (ref: string): boolean =>
+        req.prefixes.length === 0 || req.prefixes.some((p) => ref.startsWith(p));
+      if (matches('HEAD') && req.symrefs) {
+        if (mainTip) lines.push(pktLine(`${mainTip} HEAD symref-target:refs/heads/main\n`));
+        else if (req.unborn) lines.push(pktLine('unborn HEAD symref-target:refs/heads/main\n'));
+      }
+      for (const r of refs) {
+        if (!matches(r.ref)) continue;
+        let line = `${r.oid} ${r.ref}`;
+        if (req.peel && r.peeled) line += ` peeled:${r.peeled}`;
+        lines.push(pktLine(`${line}\n`));
+      }
     }
-    for (const r of refs) {
-      if (!matches(r.ref)) continue;
-      let line = `${r.oid} ${r.ref}`;
-      if (req.peel && r.peeled) line += ` peeled:${r.peeled}`;
-      lines.push(pktLine(`${line}\n`));
-    }
-  }
-  lines.push(PKT_FLUSH);
-  return { status: 200, contentType: UPLOAD_RESULT, body: Buffer.concat(lines) };
+    lines.push(PKT_FLUSH);
+    return Buffer.concat(lines);
+  });
+  return { status: 200, contentType: UPLOAD_RESULT, body };
 }
 
 function handleFetch(store: Store, owner: string, name: string, req: FetchRequest): GitResponse {
@@ -370,7 +420,7 @@ function handleFetch(store: Store, owner: string, name: string, req: FetchReques
       if (r.oid === want) wantedLines.push(`${want} ${r.ref}`);
     }
   }
-  const pack = buildPack(repo.objects, [...toSend]);
+  const pack = cachedBuildPack(repo, repo.objects, [...toSend]);
   const sections: Buffer[][] = [];
   // The acknowledgments section appears ONLY while negotiation is open:
   // the client sent haves but no `done`. When `done` is sent (always, by
@@ -448,7 +498,7 @@ function handleUploadPackV0(store: Store, owner: string, name: string, body: Buf
   if (haves.length === 0) ackLines.push('NAK');
   else if (haves.every((h) => repo.objects.has(h))) ackLines.push(`ACK ${haves[0]}`);
   else ackLines.push('NAK');
-  const pack = buildPack(repo.objects, [...toSend]);
+  const pack = cachedBuildPack(repo, repo.objects, [...toSend]);
   const parts: Buffer[] = [];
   for (const l of ackLines) parts.push(pktLine(`${l}\n`));
   parts.push(sidebandData(pack));
@@ -568,6 +618,10 @@ export function handleReceivePack(store: Store, owner: string, name: string, bod
       reportLines.push(`ok ${cmd.ref}`);
     }
   }
+  // Any ref the client moved invalidates the cached advertisements and
+  // ls-refs listings for this repo (see cachedAd above). The bump is
+  // unconditional here: if nothing moved it is only a cache miss.
+  repo.refsVersion += 1;
   // The report is pkt-line framed first (one line per packet, then a
   // flush), exactly as git's own receive-pack builds it; only then is
   // that framed buffer carried as side-band band 1. The client demuxes

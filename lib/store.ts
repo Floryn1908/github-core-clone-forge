@@ -64,6 +64,11 @@ export interface Repo {
   nextIssue: number;
   nextPull: number;
   nextComment: number;
+  // Mutation counters for the response caches (gitproto.ts, rest.ts):
+  // refsVersion rises on every ref set/delete, issueVersion only on
+  // patchIssue. A bump is only ever a cache miss, never a wrong answer.
+  refsVersion: number;
+  issueVersion: number;
 }
 
 export class ApiError extends Error {
@@ -119,6 +124,8 @@ export class Store {
       nextIssue: 1,
       nextPull: 1,
       nextComment: 1,
+      refsVersion: 0,
+      issueVersion: 0,
     };
     this.nextRepoId += 1;
     this.repos.set(key, repo);
@@ -176,6 +183,7 @@ export class Store {
     const commitSha = hashObject('commit', commitData);
     repo.objects.set(commitSha, { type: 'commit', data: commitData });
     repo.refs.set(ref, commitSha);
+    repo.refsVersion += 1;
     return { blobSha, commitSha, created };
   }
 
@@ -248,6 +256,7 @@ export class Store {
     const commitSha = hashObject('commit', commitData);
     repo.objects.set(commitSha, { type: 'commit', data: commitData });
     repo.refs.set(ref, commitSha);
+    repo.refsVersion += 1;
     return { commitSha };
   }
 
@@ -289,6 +298,7 @@ export class Store {
     if (!isHex40(sha) || !repo.objects.has(sha)) throw unprocessable('Object does not exist');
     if (repo.refs.has(ref)) throw unprocessable('Reference already exists');
     repo.refs.set(ref, sha);
+    repo.refsVersion += 1;
     return { ref, sha };
   }
 
@@ -334,6 +344,7 @@ export class Store {
     const issue = this.getIssue(repo, number);
     if (!issue) throw notFound('Issue not found');
     issue.state = state;
+    repo.issueVersion += 1;
     return issue;
   }
 
@@ -470,6 +481,7 @@ export class Store {
     const sha = hashObject('commit', commitData);
     repo.objects.set(sha, { type: 'commit', data: commitData });
     repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
+    repo.refsVersion += 1;
     pull.state = 'closed';
     pull.merged = true;
     pull.mergedAt = isoNow();
